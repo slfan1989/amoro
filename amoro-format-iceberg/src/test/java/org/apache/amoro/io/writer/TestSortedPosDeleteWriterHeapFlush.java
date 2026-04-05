@@ -18,6 +18,8 @@
 
 package org.apache.amoro.io.writer;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
 import org.apache.amoro.BasicTableTestHelper;
 import org.apache.amoro.TableFormat;
 import org.apache.amoro.catalog.BasicCatalogTestHelper;
@@ -41,8 +43,6 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class TestSortedPosDeleteWriterHeapFlush extends TableTestBase {
 

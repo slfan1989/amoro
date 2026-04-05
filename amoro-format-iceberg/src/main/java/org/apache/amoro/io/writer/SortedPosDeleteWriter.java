@@ -24,6 +24,7 @@ import org.apache.amoro.io.AuthenticatedFileIO;
 import org.apache.amoro.shade.guava32.com.google.common.collect.Lists;
 import org.apache.amoro.shade.guava32.com.google.common.collect.Maps;
 import org.apache.amoro.table.BaseTable;
+import org.apache.amoro.table.TableProperties;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.StructLike;
@@ -49,6 +50,25 @@ import java.util.Map;
  */
 public class SortedPosDeleteWriter<T> implements Closeable {
   private static final long DEFAULT_RECORDS_NUM_THRESHOLD = Long.MAX_VALUE;
+  private static final Runtime RUNTIME = Runtime.getRuntime();
+  private static final HeapUsageProvider RUNTIME_HEAP_USAGE =
+      new HeapUsageProvider() {
+        @Override
+        public long maxMemory() {
+          return RUNTIME.maxMemory();
+        }
+
+        @Override
+        public long usedMemory() {
+          return RUNTIME.totalMemory() - RUNTIME.freeMemory();
+        }
+      };
+
+  interface HeapUsageProvider {
+    long maxMemory();
+
+    long usedMemory();
+  }
 
   private final Map<CharSequenceWrapper, List<PosRow<T>>> posDeletes = Maps.newHashMap();
   private final List<DeleteFile> completedFiles = Lists.newArrayList();
@@ -61,6 +81,9 @@ public class SortedPosDeleteWriter<T> implements Closeable {
   private final FileFormat format;
   private final TaskWriterKey writerKey;
   private final long recordsNumThreshold;
+  private final double heapUsageRatioThreshold;
+  private final int heapFlushMinRecords;
+  private final HeapUsageProvider heapUsageProvider;
 
   private int records = 0;
 
@@ -72,7 +95,35 @@ public class SortedPosDeleteWriter<T> implements Closeable {
       long mask,
       long index,
       StructLike partitionKey,
-      long recordsNumThreshold) {
+      long recordsNumThreshold,
+      double heapUsageRatioThreshold,
+      int heapFlushMinRecords) {
+    this(
+        appenderFactory,
+        fileFactory,
+        io,
+        format,
+        mask,
+        index,
+        partitionKey,
+        recordsNumThreshold,
+        heapUsageRatioThreshold,
+        heapFlushMinRecords,
+        RUNTIME_HEAP_USAGE);
+  }
+
+  SortedPosDeleteWriter(
+      FileAppenderFactory<T> appenderFactory,
+      OutputFileFactory fileFactory,
+      AuthenticatedFileIO io,
+      FileFormat format,
+      long mask,
+      long index,
+      StructLike partitionKey,
+      long recordsNumThreshold,
+      double heapUsageRatioThreshold,
+      int heapFlushMinRecords,
+      HeapUsageProvider heapUsageProvider) {
     this.appenderFactory = appenderFactory;
     this.fileFactory = fileFactory;
     this.io = io;
@@ -80,6 +131,31 @@ public class SortedPosDeleteWriter<T> implements Closeable {
     this.writerKey =
         new TaskWriterKey(partitionKey, DataTreeNode.of(mask, index), DataFileType.POS_DELETE_FILE);
     this.recordsNumThreshold = recordsNumThreshold;
+    this.heapUsageRatioThreshold = heapUsageRatioThreshold;
+    this.heapFlushMinRecords = heapFlushMinRecords;
+    this.heapUsageProvider = heapUsageProvider;
+  }
+
+  public SortedPosDeleteWriter(
+      FileAppenderFactory<T> appenderFactory,
+      OutputFileFactory fileFactory,
+      AuthenticatedFileIO io,
+      FileFormat format,
+      long mask,
+      long index,
+      StructLike partitionKey,
+      long recordsNumThreshold) {
+    this(
+        appenderFactory,
+        fileFactory,
+        io,
+        format,
+        mask,
+        index,
+        partitionKey,
+        recordsNumThreshold,
+        TableProperties.POS_DELETE_FLUSH_HEAP_RATIO_DEFAULT,
+        TableProperties.POS_DELETE_FLUSH_HEAP_MIN_RECORDS_DEFAULT);
   }
 
   public SortedPosDeleteWriter(
@@ -98,7 +174,9 @@ public class SortedPosDeleteWriter<T> implements Closeable {
         mask,
         index,
         partitionKey,
-        DEFAULT_RECORDS_NUM_THRESHOLD);
+        DEFAULT_RECORDS_NUM_THRESHOLD,
+        TableProperties.POS_DELETE_FLUSH_HEAP_RATIO_DEFAULT,
+        TableProperties.POS_DELETE_FLUSH_HEAP_MIN_RECORDS_DEFAULT);
   }
 
   public SortedPosDeleteWriter(
@@ -115,7 +193,31 @@ public class SortedPosDeleteWriter<T> implements Closeable {
         0,
         0,
         partitionKey,
-        DEFAULT_RECORDS_NUM_THRESHOLD);
+        DEFAULT_RECORDS_NUM_THRESHOLD,
+        TableProperties.POS_DELETE_FLUSH_HEAP_RATIO_DEFAULT,
+        TableProperties.POS_DELETE_FLUSH_HEAP_MIN_RECORDS_DEFAULT);
+  }
+
+  public SortedPosDeleteWriter(
+      FileAppenderFactory<T> appenderFactory,
+      OutputFileFactory fileFactory,
+      AuthenticatedFileIO io,
+      FileFormat format,
+      StructLike partitionKey,
+      long recordsNumThreshold,
+      double heapUsageRatioThreshold,
+      int heapFlushMinRecords) {
+    this(
+        appenderFactory,
+        fileFactory,
+        io,
+        format,
+        0,
+        0,
+        partitionKey,
+        recordsNumThreshold,
+        heapUsageRatioThreshold,
+        heapFlushMinRecords);
   }
 
   public void delete(CharSequence path, long pos) {
@@ -132,9 +234,7 @@ public class SortedPosDeleteWriter<T> implements Closeable {
 
     records += 1;
 
-    // TODO Flush buffer based on the policy that checking whether whole heap memory size exceed the
-    // threshold.
-    if (records >= recordsNumThreshold) {
+    if (records >= recordsNumThreshold || shouldFlushByHeap()) {
       flushDeletes();
     }
   }
@@ -206,6 +306,24 @@ public class SortedPosDeleteWriter<T> implements Closeable {
 
     // Add the completed delete files.
     completedFiles.add(writer.toDeleteFile());
+  }
+
+  private boolean shouldFlushByHeap() {
+    // Guard: allow disabling heap-based flushing by setting an invalid ratio.
+    if (heapUsageRatioThreshold <= 0 || heapUsageRatioThreshold >= 1) {
+      return false;
+    }
+    // Guard: avoid flushing too frequently on small buffers.
+    if (records < Math.max(1, heapFlushMinRecords)) {
+      return false;
+    }
+    long max = heapUsageProvider.maxMemory();
+    if (max <= 0) {
+      return false;
+    }
+    // Approximate current heap usage; do not force GC here.
+    long used = heapUsageProvider.usedMemory();
+    return used >= (long) (max * heapUsageRatioThreshold);
   }
 
   private static class PosRow<R> {
